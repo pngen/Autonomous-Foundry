@@ -377,11 +377,52 @@ void check_snapshot_coherence(const FoundrySnapshot& snapshot, ProblemLog& probl
 }
 
 // ---------------------------------------------------------------------------
+// Reader progress
+// ---------------------------------------------------------------------------
+
+/// Progress signal for one reader thread of a case whose writer is bounded.
+///
+/// A writer that performs a fixed number of rounds makes the durable counts such
+/// a case asserts exact, and says nothing about whether a reader ever got the
+/// lock: under contention a reader can lose every race and reach the end with
+/// zero rounds. That zero is then indistinguishable from a read path that ran
+/// and observed nothing, so a case that asserts reader progress waits for it
+/// rather than assuming it.
+struct ReaderProgress {
+  std::atomic<bool> progressed{false};
+  std::atomic<bool> finished{false};
+};
+
+/// Wait until every reader has completed a round or has stopped on its own.
+///
+/// This is progress, not a deadline: nothing here bounds how long a reader may
+/// take. A reader that exits without completing a round is then reported by the
+/// case's own progress assertion - a verdict - instead of being silently
+/// tolerated by it.
+void await_reader_progress(const std::vector<ReaderProgress>& progress) {
+  for (;;) {
+    bool waiting = false;
+    for (const ReaderProgress& entry : progress) {
+      if (!entry.progressed.load(std::memory_order_acquire) &&
+          !entry.finished.load(std::memory_order_acquire)) {
+        waiting = true;
+        break;
+      }
+    }
+    if (!waiting) {
+      return;
+    }
+    std::this_thread::yield();
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Reader bodies
 // ---------------------------------------------------------------------------
 
 void read_paths_reader(FoundryCore& core, PopulationId population, const std::atomic<bool>& stop,
-                       ProblemLog& problems, std::uint64_t* iterations) {
+                       ProblemLog& problems, std::uint64_t* iterations,
+                       ReaderProgress* progress = nullptr) {
   std::uint64_t revision = core.revision();
   FoundryStatistics statistics = core.statistics();
   std::size_t candidate_count = 0;
@@ -497,8 +538,14 @@ void read_paths_reader(FoundryCore& core, PopulationId population, const std::at
       problems.add("snapshot publishes more candidates than it holds");
       break;
     }
+    if (progress != nullptr && !progress->progressed.load(std::memory_order_relaxed)) {
+      progress->progressed.store(true, std::memory_order_release);
+    }
   }
   *iterations = rounds;
+  if (progress != nullptr) {
+    progress->finished.store(true, std::memory_order_release);
+  }
 }
 
 struct SnapshotTally {
@@ -507,11 +554,14 @@ struct SnapshotTally {
 };
 
 void snapshot_reader(FoundryCore& core, const std::atomic<bool>& stop, ProblemLog& problems,
-                     SnapshotTally* tally) {
+                     SnapshotTally* tally, ReaderProgress* progress = nullptr) {
   SnapshotTally local;
   while (!stop.load(std::memory_order_acquire)) {
     const FoundrySnapshot snapshot = core.snapshot();
     ++local.taken;
+    if (progress != nullptr) {
+      progress->progressed.store(true, std::memory_order_release);
+    }
     check_snapshot_coherence(snapshot, problems);
 
     const Result<std::string> image = serialize_snapshot(snapshot);
@@ -533,6 +583,9 @@ void snapshot_reader(FoundryCore& core, const std::atomic<bool>& stop, ProblemLo
     ++local.round_tripped;
   }
   *tally = local;
+  if (progress != nullptr) {
+    progress->finished.store(true, std::memory_order_release);
+  }
 }
 
 /// A reader runs a fixed number of iterations, so its own termination never
@@ -571,6 +624,7 @@ AF_TEST_CASE(concurrency, read_paths_stay_consistent_while_a_writer_mutates) {
   std::atomic<bool> stop{false};
   ProblemLog problems;
   std::vector<std::uint64_t> reader_rounds(kReaders, 0);
+  std::vector<ReaderProgress> progress(kReaders);
   std::uint64_t writer_rounds = 0;
   std::string writer_failure;
 
@@ -586,19 +640,25 @@ AF_TEST_CASE(concurrency, read_paths_stay_consistent_while_a_writer_mutates) {
       }
       ++writer_rounds;
     }
-    stop.store(true, std::memory_order_release);
+    // The readers are not stopped here. The writer's rounds are bounded so the
+    // durable counts the case asserts are exact, and that bound says nothing
+    // about whether a reader ever got the lock; the case stops the readers only
+    // once each has completed a round.
   });
 
   std::vector<std::thread> readers;
   readers.reserve(kReaders);
   for (std::size_t index = 0; index < kReaders; ++index) {
     readers.emplace_back([&, index]() {
-      read_paths_reader(fixture.core, fixture.population, stop, problems, &reader_rounds[index]);
+      read_paths_reader(fixture.core, fixture.population, stop, problems, &reader_rounds[index],
+                        &progress[index]);
     });
   }
 
   af_ctx.phase("WAIT");
   writer.join();
+  await_reader_progress(progress);
+  stop.store(true, std::memory_order_release);
   for (std::thread& reader : readers) {
     reader.join();
   }
@@ -675,6 +735,7 @@ AF_TEST_CASE(concurrency, snapshots_are_complete_immutable_copies_under_mutation
   std::atomic<bool> stop{false};
   ProblemLog problems;
   std::vector<SnapshotTally> tallies(kReaders);
+  std::vector<ReaderProgress> progress(kReaders);
   std::uint64_t writer_rounds = 0;
   std::string writer_failure;
 
@@ -690,18 +751,24 @@ AF_TEST_CASE(concurrency, snapshots_are_complete_immutable_copies_under_mutation
       }
       ++writer_rounds;
     }
-    stop.store(true, std::memory_order_release);
+    // The readers are not stopped here. The writer's rounds are bounded so the
+    // durable counts the case asserts are exact, and that bound says nothing
+    // about whether a reader ever took a snapshot; the case stops the readers
+    // only once each has taken one.
   });
 
   std::vector<std::thread> readers;
   readers.reserve(kReaders);
   for (std::size_t index = 0; index < kReaders; ++index) {
-    readers.emplace_back(
-        [&, index]() { snapshot_reader(fixture.core, stop, problems, &tallies[index]); });
+    readers.emplace_back([&, index]() {
+      snapshot_reader(fixture.core, stop, problems, &tallies[index], &progress[index]);
+    });
   }
 
   af_ctx.phase("WAIT");
   writer.join();
+  await_reader_progress(progress);
+  stop.store(true, std::memory_order_release);
   for (std::thread& reader : readers) {
     reader.join();
   }

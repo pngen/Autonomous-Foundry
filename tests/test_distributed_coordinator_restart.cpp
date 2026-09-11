@@ -483,7 +483,20 @@ AF_TEST_CASE(distributed_coordinator_restart,
   AF_DIST_REQUIRE_OK(af_ctx, published);
   EXPECT_EQ(af_ctx, published.value().candidate.state, CandidateState::Published);
   EXPECT_TRUE(af_ctx, published.value().candidate.artifact_set_digest.size() > 0u);
-  EXPECT_TRUE(af_ctx, published.value().evaluations.empty());
+  // A publication carries exactly one piece of evidence of its own: the
+  // producer's self report. The coordinator records it, and it is not
+  // authoritative however confident it is, so nothing an evaluator produced can
+  // be here -- the task declares no requirement any evaluator could satisfy.
+  std::string evidence;
+  for (const EvaluationRecord& record : published.value().evaluations) {
+    if (!evidence.empty()) {
+      evidence.append(", ");
+    }
+    evidence.append(record.evaluator_key);
+    EXPECT_FALSE(af_ctx, evaluator_kind_is_authoritative(record.kind));
+  }
+  af_ctx.note("published evidence before the restart: [" + evidence + "]");
+  EXPECT_TRUE(af_ctx, published.value().evaluations.size() <= 1u);
 
   af_ctx.phase("RESTART");
   AF_DIST_REQUIRE_OK(af_ctx, first_coordinator.kill());

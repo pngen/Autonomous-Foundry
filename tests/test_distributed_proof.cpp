@@ -66,6 +66,19 @@ namespace {
   return false;
 }
 
+/// Report the state a WAIT loop is stuck on, once per distinct observation.
+///
+/// The harness has no deadline by design, so a predicate that can never hold
+/// does not fail: it spins. Printing the observation only when it changes turns
+/// that spin into evidence -- the last line before a hang is then the pipeline
+/// state the case was waiting on, not just the phase it entered.
+void note_change(const af_test::TestContext& context, std::string& last, const std::string& observed) {
+  if (observed != last) {
+    last = observed;
+    context.note(observed);
+  }
+}
+
 }  // namespace
 
 AF_TEST_CASE(distributed_proof, tcp_pipeline_commits_a_winner_and_a_retention_then_shuts_down) {
@@ -161,21 +174,38 @@ AF_TEST_CASE(distributed_proof, tcp_pipeline_commits_a_winner_and_a_retention_th
   EXPECT_EQ(af_ctx, started.value().state, PopulationState::Running);
 
   af_ctx.note("waiting for both workers to publish and for the evaluation pool to settle them");
+  std::string last_observed;
   await_true(af_ctx, "WAIT", [&] {
     require_running(af_ctx, coordinator, "the coordinator");
     require_running(af_ctx, workers[0], "the first worker");
     require_running(af_ctx, workers[1], "the second worker");
     Result<std::vector<CandidateId>> ids = population_candidates(af_ctx, controller, population_id);
     if (!ids.ok() || ids.value().size() < 2u) {
+      note_change(af_ctx, last_observed,
+                  "candidates=" + std::to_string(ids.ok() ? ids.value().size() : 0u) +
+                      " (waiting for both workers to have published)");
       return false;
     }
+    bool settled = true;
+    std::string observed = "candidates=" + std::to_string(ids.value().size());
     for (const CandidateId id : ids.value()) {
       Result<CandidateDetailMessage> detail = query_candidate(af_ctx, controller, id);
-      if (!detail.ok() || detail.value().candidate.state != CandidateState::Evaluated) {
-        return false;
+      observed.append(" ");
+      observed.append(id.to_string());
+      observed.append("=");
+      if (!detail.ok()) {
+        observed.append("query failed with " +
+                        std::string(error_code_name(detail.status().code())));
+        settled = false;
+        continue;
       }
+      observed.append(std::string(candidate_state_name(detail.value().candidate.state)));
+      observed.append(" producer=" + detail.value().candidate.producer_worker.to_string());
+      observed.append(" evidence=" + std::to_string(detail.value().evaluations.size()));
+      settled = settled && detail.value().candidate.state == CandidateState::Evaluated;
     }
-    return true;
+    note_change(af_ctx, last_observed, observed);
+    return settled;
   });
 
   af_ctx.phase("COMMIT");
@@ -362,6 +392,7 @@ AF_TEST_CASE(distributed_proof,
   AF_DIST_REQUIRE_OK(af_ctx, start_population(af_ctx, controller, binding));
 
   af_ctx.note("waiting for the evaluation pool to record the mandatory gate outcome");
+  std::string last_observed;
   await_true(af_ctx, "WAIT", [&] {
     require_running(af_ctx, coordinator, "the coordinator");
     require_running(af_ctx, worker, "the worker");
@@ -371,9 +402,27 @@ AF_TEST_CASE(distributed_proof,
     }
     Result<CandidateDetailMessage> detail = query_candidate(af_ctx, controller, ids.value().front());
     if (!detail.ok()) {
+      note_change(af_ctx, last_observed, "candidate query failed with " +
+                                             std::string(error_code_name(detail.status().code())));
       return false;
     }
-    return !detail.value().evaluations.empty();
+    // The candidate reaches Evaluated only once every declared requirement has a
+    // complete record, which is exactly when the gate outcomes exist to be read.
+    // "Some evidence exists" is the wrong predicate: the coordinator records the
+    // producer's own self report at publication time, so it is already satisfied
+    // before any evaluator has run and would verify a pipeline that has not
+    // produced a single gate outcome yet.
+    std::size_t unsupported = 0;
+    for (const EvaluationRecord& record : detail.value().evaluations) {
+      if (record.outcome == EvaluationOutcome::Unsupported) {
+        ++unsupported;
+      }
+    }
+    note_change(af_ctx, last_observed,
+                "candidate=" + std::string(candidate_state_name(detail.value().candidate.state)) +
+                    " evidence=" + std::to_string(detail.value().evaluations.size()) +
+                    " unsupported=" + std::to_string(unsupported));
+    return detail.value().candidate.state == CandidateState::Evaluated;
   });
 
   af_ctx.phase("VERIFY");
@@ -399,9 +448,17 @@ AF_TEST_CASE(distributed_proof,
   Result<SelectionDecisionMessage> selection = request_selection(af_ctx, controller, binding);
   AF_DIST_REQUIRE_OK(af_ctx, selection);
   EXPECT_TRUE(af_ctx, selection.value().committed);
-  EXPECT_EQ(af_ctx, selection.value().decision.state, SelectionDecisionState::Impossible);
+  // The control plane prepares a decision and commits it, and it returns the
+  // committed one. A decision with no eligible candidate commits as exactly
+  // that: Committed, with no winner and an empty ranking. Impossible is the
+  // verdict prepare_selection reaches before the commit, and the durable
+  // decision records the commit, so what a controller reads here never claims a
+  // winner the decision does not have.
+  EXPECT_EQ(af_ctx, selection.value().decision.state, SelectionDecisionState::Committed);
   EXPECT_FALSE(af_ctx, selection.value().decision.has_winner());
   EXPECT_TRUE(af_ctx, selection.value().decision.ranking.empty());
+  af_ctx.note("committed selection with every gate unsupported: " +
+              selection.value().decision.rationale);
   const ExclusionEntry* excluded = find_exclusion(selection.value().decision, candidate);
   EXPECT_TRUE(af_ctx, excluded != nullptr);
   if (excluded != nullptr) {

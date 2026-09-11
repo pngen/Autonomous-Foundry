@@ -210,6 +210,11 @@ Status FoundryCoordinator::Impl::handle_controller_message(const std::uint64_t c
       return reply(connection_id, MessageType::AttemptCancelled, response);
     }
     case MessageType::QueryPopulation: {
+      // A reader takes the same barrier the dispatch path takes, so it can never
+      // answer with a population, a candidate list or an attempt whose snapshot
+      // has not landed. Reached through a frame the barrier is already held;
+      // naming it here keeps the guarantee attached to the read itself.
+      const std::lock_guard<std::recursive_mutex> durability(durability_mutex);
       QueryPopulationMessage message;
       AF_TRY_ASSIGN(message, decode_query_population(frame.payload));
       PopulationRecord population;
@@ -223,6 +228,10 @@ Status FoundryCoordinator::Impl::handle_controller_message(const std::uint64_t c
       return reply(connection_id, MessageType::PopulationDetail, response);
     }
     case MessageType::QueryCandidate: {
+      // A reader takes the same barrier the dispatch path takes: an attempt
+      // reported here is an attempt the successor will find in the snapshot,
+      // never one this incumbent authorized in memory and has not written yet.
+      const std::lock_guard<std::recursive_mutex> durability(durability_mutex);
       QueryCandidateMessage message;
       AF_TRY_ASSIGN(message, decode_query_candidate(frame.payload));
       CandidateRecord candidate;
@@ -278,6 +287,10 @@ Status FoundryCoordinator::Impl::handle_controller_message(const std::uint64_t c
       return reply(connection_id, MessageType::LineageDetail, response);
     }
     case MessageType::QueryStatistics: {
+      // A reader takes the same barrier the dispatch path takes, so a counter
+      // that reports a candidate slot, an attempt or a publication is a counter
+      // whose value is already written down.
+      const std::lock_guard<std::recursive_mutex> durability(durability_mutex);
       QueryStatisticsMessage message;
       AF_TRY_ASSIGN(message, decode_query_statistics(frame.payload));
       StatisticsDetailMessage response;

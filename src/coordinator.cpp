@@ -138,6 +138,19 @@ void af_report_connection_fault(const std::uint64_t connection_id, const char* p
   std::fflush(stdout);
 }
 
+/// A record the core refused is reported here rather than dropped in silence.
+///
+/// A refusal leaves its requirement outstanding, so the pump schedules the same
+/// evaluation again on its next tick: without this line a refused commit is
+/// indistinguishable from an evaluation that never ran, and the candidate sits
+/// in Evaluating forever with nothing on the operator log to say why.
+void af_report_refused_evidence(const CandidateId candidate, const Status& status) {
+  std::printf("af_coordinator: evidence for candidate %s was refused by the core: %s (code %s)\n",
+              candidate.to_string().c_str(), status.message().c_str(),
+              std::string(error_code_name(status.code())).c_str());
+  std::fflush(stdout);
+}
+
 /// Identity of the controller authority the coordinator issues for its own
 /// operator surface. Derived from the durable foundry identity, so it is stable
 /// across a restart and never collides with an operator's own identity.
@@ -331,6 +344,32 @@ struct FoundryCoordinator::Impl
   // -- lifecycle -----------------------------------------------------------
 
   std::mutex lifecycle_mutex;
+
+  /// Serializes "change authoritative state and make the change durable"
+  /// against "report that state to a reader".
+  ///
+  /// Every authoritative change in this file is a pair: mutate the core, then
+  /// persist the snapshot. The order is what makes a crash explainable, and the
+  /// order alone is not enough. A controller that queries between the two would
+  /// be handed authority -- an authorized attempt, a candidate slot, a
+  /// publication -- that no successor coordinator can find on disk, and a crash
+  /// inside the write would lose it silently instead of recovering it as
+  /// ambiguous. Writers and readers therefore take this one barrier, so no query
+  /// can observe an attempt, a candidate or an outcome before the snapshot that
+  /// records it has landed. The dispatch path takes it around
+  /// authorize -> persist -> confirm -> send; the read handlers take it around
+  /// the answer they build; every frame takes it around its handler.
+  ///
+  /// It is re-entrant because those scopes nest on one thread: a frame holds it
+  /// for the whole handler, and a handler may reach a read handler or raise a
+  /// protocol violation whose close is itself a writer. Only one thread can hold
+  /// it at a time, so re-entry never weakens the exclusion; it only lets a
+  /// thread that already owns the barrier reach it again through a nested path
+  /// instead of deadlocking against itself.
+  ///
+  /// This is a correctness barrier, not a deadline: nothing here bounds how long
+  /// a writer is allowed to take.
+  std::recursive_mutex durability_mutex;
   std::condition_variable lifecycle_wake;
   bool start_guard{false};
   std::atomic<bool> started{false};
@@ -429,8 +468,9 @@ struct FoundryCoordinator::Impl
   /// evaluator, a refused pre-flight check and an evaluator that throws all
   /// become honest non-pass outcomes; none of them can produce a pass.
   [[nodiscard]] EvaluationRecord evaluate_requirement(
-      FoundryCore& core_state, const CandidateRecord& candidate, const TaskSpec& task,
-      const EvaluationRequirement& requirement, const std::filesystem::path& scratch);
+      FoundryCore& core_state, const EvaluationJob& job, const CandidateRecord& candidate,
+      const TaskSpec& task, const EvaluationRequirement& requirement,
+      const std::filesystem::path& scratch);
 };
 
 // ---------------------------------------------------------------------------
@@ -495,6 +535,12 @@ Status FoundryCoordinator::Impl::protocol_violation(const std::uint64_t connecti
 
 void FoundryCoordinator::Impl::note_close(const std::uint64_t connection_id,
                                           const Status& reason) {
+  // A disconnect also mutates authoritative state -- an in-flight attempt
+  // becomes OutcomeUnknown -- so it takes the same barrier as any other writer:
+  // the outcome must be durable before a reader may see it. This is also a
+  // nested path: a protocol violation raised inside a frame closes the
+  // connection, so the barrier is often already held by this very thread.
+  const std::unique_lock<std::recursive_mutex> durability(durability_mutex);
   bool was_worker = false;
   bool had_session = false;
   WorkerSessionAuthority session;
@@ -611,6 +657,18 @@ void FoundryCoordinator::Impl::handle_frame(const std::uint64_t connection_id, c
   // Every frame runs on the reader thread of exactly one connection. It may
   // call into the core and it may enqueue a reply, but it must never block and
   // it must never hold the registry lock across a socket operation.
+  //
+  // A frame is the coordinator's unit of authoritative change. A writing
+  // handler mutates the core and then persists it; a reading handler reports
+  // state a dispatch may be changing underneath it. Holding the durability
+  // barrier for the whole frame makes the first pair indivisible with respect to
+  // every reader and makes every answer a description of a snapshot that has
+  // already landed. Doing it here, once, is what keeps a future handler from
+  // silently reopening the window this barrier exists to close.
+  //
+  // The barrier is re-entrant: the nesting is a read handler, or the close a
+  // protocol violation raises below, and both are documented where they take it.
+  const std::unique_lock<std::recursive_mutex> durability(durability_mutex);
   mutate_stats([](CoordinatorStatistics& stats) { stats.frames_received += 1; });
 
   bool is_worker = false;
@@ -1183,6 +1241,11 @@ void FoundryCoordinator::Impl::begin_dispatch(const std::uint64_t connection_id,
     // a dispatch target, and the core would refuse it anyway.
     return;
   }
+  // Authorize, persist, confirm and send as one indivisible step with respect
+  // to readers: the attempt -- and the candidate slot authorize_attempt creates
+  // with it -- must not be observable, and the assignment must not leave this
+  // process, until the snapshot that records the attempt is on disk.
+  const std::unique_lock<std::recursive_mutex> durability(durability_mutex);
   // The live session is rebuilt from the durable worker record, exactly as
   // every other authority this file hands to the core is, so a connection whose
   // session has since been revalidated cannot dispatch on a stale one.
@@ -1239,12 +1302,18 @@ void FoundryCoordinator::Impl::begin_dispatch(const std::uint64_t connection_id,
 // ---------------------------------------------------------------------------
 
 EvaluationRecord FoundryCoordinator::Impl::evaluate_requirement(
-    FoundryCore& core_state, const CandidateRecord& candidate, const TaskSpec& task,
-    const EvaluationRequirement& requirement, const std::filesystem::path& scratch) {
+    FoundryCore& core_state, const EvaluationJob& job, const CandidateRecord& candidate,
+    const TaskSpec& task, const EvaluationRequirement& requirement,
+    const std::filesystem::path& scratch) {
   EvaluationRecord record;
-  record.candidate = candidate.id;
-  // The job's generation is the one the pump observed; the candidate record is
-  // re-read here, and the core re-validates the generation on the record.
+  record.candidate = job.candidate;
+  // The generation the pump observed travels with the job and is bound to the
+  // record here; the candidate record is re-read for its population and task
+  // binding, and the core re-validates the generation when the record is
+  // committed. A record with no generation at all is not "unbound", it is
+  // stale: the core refuses it, and the evaluation it represents would never
+  // reach the durable evidence.
+  record.candidate_generation = job.candidate_generation;
   record.task = task.id;
   record.task_generation = task.generation;
   record.population = candidate.population;
@@ -1380,7 +1449,7 @@ void FoundryCoordinator::Impl::run_evaluation(const EvaluationJob& job) {
   }
 
   for (const EvaluationRequirement& requirement : pending.value()) {
-    EvaluationRecord record = evaluate_requirement(core_state, candidate.value(), task.value(),
+    EvaluationRecord record = evaluate_requirement(core_state, job, candidate.value(), task.value(),
                                                    requirement, scratch);
     mutate_stats([&record](CoordinatorStatistics& stats) {
       stats.evaluations_completed += 1;
@@ -1388,13 +1457,18 @@ void FoundryCoordinator::Impl::run_evaluation(const EvaluationJob& job) {
         stats.evaluations_failed += 1;
       }
     });
-    // The record is committed and the commit is then persisted. A coordinator
-    // that dies between the two loses the record, which reads as "this
-    // evaluation never completed" - the truth - rather than as a pass.
+    // The record is committed and the commit is then persisted under the same
+    // barrier a reader takes, so an evaluation a controller can already see is
+    // an evaluation the successor finds on disk. A coordinator that dies inside
+    // the pair loses the record, which reads as "this evaluation never
+    // completed" - the truth - rather than as a pass.
+    const std::lock_guard<std::recursive_mutex> durability(durability_mutex);
     const Status recorded = core_state.record_evaluation(std::move(record));
-    if (recorded.ok()) {
-      (void)persist(core_state);
+    if (!recorded.ok()) {
+      af_report_refused_evidence(job.candidate, recorded);
+      continue;
     }
+    (void)persist(core_state);
   }
 
   if (!scratch.empty()) {

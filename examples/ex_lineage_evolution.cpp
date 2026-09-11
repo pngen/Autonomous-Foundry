@@ -3,9 +3,9 @@
 // Evolution across populations, and what an obsolete authority can still do.
 //
 // The example runs a complete first generation, commits selection and
-// retention, advances to a second population seeded by the winner, produces and
-// evaluates a fresh generation there, and then prints the durable lineage DAG
-// with ancestors, descendants and depth for every node.
+// retention, closes it, advances to a second population seeded by the winner,
+// produces and evaluates a fresh generation there, and then prints the durable
+// lineage DAG with ancestors, descendants and depth for every node.
 //
 // It closes by replaying the exact operation authority that published the first
 // generation's winner. That authority is stale the moment the population
@@ -572,6 +572,19 @@ int main() {
   }
   Report::item("P1 retained=" + std::to_string(committed_retention_one.value().retained.size()) +
                " retired=" + std::to_string(committed_retention_one.value().retired.size()));
+
+  // A generation is closed and only then advanced. The successor names the
+  // predecessor, and a successor may only name a predecessor that is already
+  // Closed, so the closure is the caller's step: it is what proves the first
+  // generation has no in-flight attempt, no uncommitted decision and no open
+  // reservation left before its winner is carried forward.
+  Report::section("close generation 1");
+  const af::Status closed_one = core->close_population(p1);
+  if (!report.expect_status(closed_one, "P1 close_population")) {
+    return 1;
+  }
+  Report::item("P1 state=" +
+               std::string(af::population_state_name(core->population(p1).value().state)));
 
   Report::section("advance to generation 2");
   const af::Result<af::PopulationId> advanced = core->advance_population(p1, "P2-lineage");

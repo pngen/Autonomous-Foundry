@@ -207,7 +207,17 @@ AF_TEST_CASE(distributed_worker_death,
 
   Result<CandidateDetailMessage> ambiguous = query_candidate(af_ctx, harness.controller, slot);
   AF_DIST_REQUIRE_OK(af_ctx, ambiguous);
-  EXPECT_EQ(af_ctx, ambiguous.value().candidate.state, CandidateState::Registered);
+  // The slot is retryable again and no work of the dead incarnation is still
+  // presented as in flight. The survivor was deliberately started before the
+  // kill so that it is Ready the moment the slot comes back, which means the
+  // retry may be authorized between the wait above and this query: Registered,
+  // and Registered-then-redispatched, are the same fact. What this must never
+  // accept is the slot still sitting on the attempt whose worker is gone.
+  af_ctx.note("slot after the kill: state " +
+              std::string(candidate_state_name(ambiguous.value().candidate.state)) + " attempt " +
+              ambiguous.value().candidate.attempt.to_string());
+  EXPECT_TRUE(af_ctx, ambiguous.value().candidate.state == CandidateState::Registered ||
+                          ambiguous.value().candidate.attempt != first_attempt);
 
   af_ctx.note("waiting for the surviving worker to be dispatched the retry");
   await_true(af_ctx, "WAIT", [&] {
