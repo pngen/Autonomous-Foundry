@@ -1,0 +1,39 @@
+# Build trees and local compile scratch
+/build/
+/build-*/
+/build_check/
+/out/
+/cmake-build-*/
+
+# Local install prefixes and downstream consumer scratch
+/_install/
+/_consumer/
+/_closure/
+/_tmp/
+
+# Foundry runtime state produced by local runs
+*.afsnapshot
+*.afsnapshot.tmp
+foundry-state/
+workspaces/
+*.aflog
+
+# Editor / OS artifacts
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+Thumbs.db
+desktop.ini
+
+# Compiled objects and binaries that must never be committed
+*.obj
+*.o
+*.exe
+*.pdb
+*.ilk
+*.lib
+*.exp
+*.dll
+*.dSYM/
